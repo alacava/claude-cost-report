@@ -58,6 +58,28 @@ import pandas as pd
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Best-effort, dependency-free .env loader: sets os.environ for any
+    KEY=VALUE line whose key isn't already set. A .env file on disk is NOT
+    automatically part of the process environment (that's a shell/tool
+    convention, not a Python one), so this is what makes ANTHROPIC_ADMIN_KEY
+    in a local .env actually visible to os.environ.get()."""
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
 MEMBERS_SPEND = "Estimated Spend (USD)"
 SPEND_NET = "total_net_spend_usd"
 SPEND_GROSS = "total_gross_spend_usd"
@@ -454,6 +476,7 @@ def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
 
 
 def main():
+    load_dotenv()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", type=Path)

@@ -222,12 +222,22 @@ so one workbook can show the complete picture.
 1. In [Claude Console](https://platform.claude.com) → **Settings →
    Admin API keys**, create an Admin API key (starts with
    `sk-ant-admin01-...`). You need to be an org admin.
-2. Export it as an environment variable — never pass it on the command
-   line (it'll end up in your shell history):
+2. Make it available as `ANTHROPIC_ADMIN_KEY` — never pass it on the
+   command line (it'll end up in your shell history). Either:
 
    ```bash
    export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
    ```
+
+   or drop a `.env` file (already gitignored) next to the script:
+
+   ```
+   ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
+   ```
+
+   The script loads `.env` from the current directory on startup — a
+   plain `KEY=VALUE` file, no extra dependency required. A real
+   exported shell variable always takes precedence over `.env`.
 
 ### Running it
 

@@ -1,0 +1,8 @@
+# Exports contain member emails and spend — keep them out of the repo
+*.csv
+*.xlsx
+
+__pycache__/
+*.pyc
+.venv/
+venv/

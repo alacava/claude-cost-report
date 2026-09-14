@@ -182,6 +182,7 @@ python3 claude_team_cost_report.py spend.csv --roster members.csv \
 | **Per-User Cost** | One row per member: seat tier, requests, usage spend, seat fee (formula driven by Assumptions), total cost, % of total, with a totals row |
 | **By Product & Model** | (spend-report input only) The full breakdown: requests, prompt/completion tokens, net and gross spend per user/product/model |
 | **Console API Usage** | (only with `--console-usage`) Workspace / model / cost-type breakdown of `platform.claude.com` API spend, with a totals row. Kept separate from Per-User Cost — see [§6](#6-consoleapi-usage-optional---console-usage) |
+| **Cost by API Key** | (only with `--console-usage`) Token usage per API key, plus exact `$` where attributable and a pricing-based `$` estimate where not — see [§6](#6-consoleapi-usage-optional---console-usage) |
 
 Seat fees, totals, and percentages are live formulas, not hardcoded
 values. Open the file once in Excel or LibreOffice so the formulas
@@ -258,13 +259,61 @@ cost type (tokens / web search / code execution), and service tier,
 with a totals row — plus the same breakdown's top lines and grand
 total printed to the console.
 
-**This total is *not* added into Per-User Cost or its TOTAL row.**
-Console/API usage is billed by API key and workspace, not by named
-Team member, so there's no reliable way to attribute it to a person —
-attempting to fold it into the per-user total would silently misstate
-individual costs. The two totals are shown side by side (console
-output and the Assumptions sheet notes) so you can see the org's full
-Claude spend, without pretending they're the same kind of number.
+A **Cost by API Key** sheet: token usage (input/output/total), an exact
+dollar `Amount (USD)`, an `Estimated Amount (USD)`, and a `Note`
+explaining each row. Read the note column — this sheet has two kinds
+of row:
+
+- **Exact `Amount (USD)`, no estimate needed** — when a workspace's
+  *entire* cost for the period traces to one usage source (one API
+  key, or unkeyed Console/Playground activity), that source gets the
+  workspace's real dollar amount directly from the Cost Report.
+- **Blank `Amount (USD)`, filled `Estimated Amount (USD)` instead,
+  plus a flagged workspace-total row** — when a workspace has
+  *multiple* keys/sources active in the period, there's no exact
+  per-key figure to show (see below), so each key's row instead gets
+  an estimate, and a `— WORKSPACE TOTAL (N sources) —` row carries the
+  real combined dollar amount.
+
+  **Why an estimate instead of splitting the exact total?**
+  Anthropic's Cost Report API can only be grouped by workspace — never
+  by API key — so there's no per-key dollar figure to split in the
+  first place. Prorating the workspace total by token count would look
+  precise but often isn't (different keys can use different
+  models/service tiers at very different prices). Instead, `Estimated
+  Amount (USD)` is computed independently, per key, per model, per
+  service tier, from real token counts (the Usage Report, which *can*
+  group by key) multiplied by published per-model rates — same
+  approach as your `claude-api-exporter`'s `anthropic_estimated_cost_usd`
+  metric. It will not exactly match the workspace total; that's
+  expected, not a bug.
+
+  **Pricing source:** since Anthropic publishes no machine-readable
+  pricing feed (only prose docs pages), rates come from
+  `claude-api-exporter`'s
+  [`pricing.json`](https://github.com/alacava/claude-api-exporter/blob/main/pricing.json),
+  fetched fresh on every run. If that fetch fails (offline, repo
+  moved), the last successful copy is used from a local
+  `.pricing_cache.json` (gitignored); if there's no cache either, the
+  `Estimated Amount (USD)` column is simply left blank for those rows
+  — everything else in the report still works. A model missing from
+  `pricing.json` falls back to its generic `"default"` rate, flagged
+  in that row's `Note`.
+
+  Known simplifications in the estimate (documented in
+  `estimate_cost_usd`'s docstring): 1-hour cache writes are priced at
+  the 5-minute cache-write rate (`pricing.json` only tracks one), and
+  the `inference_geo` "us" 1.1x multiplier isn't applied. The Batch
+  API's flat 50% discount *is* applied.
+
+**Neither Console/API total (exact or estimated) is added into
+Per-User Cost or its TOTAL row.** Console/API usage is billed by API
+key and workspace, not by named Team member, so there's no reliable
+way to attribute it to a person — attempting to fold it into the
+per-user total would silently misstate individual costs. The totals
+are shown side by side (console output and the Assumptions sheet
+notes) so you can see the org's full Claude spend, without pretending
+they're the same kind of number.
 
 ---
 
@@ -286,10 +335,14 @@ Claude spend, without pretending they're the same kind of number.
   the download step stays manual. (`--console-usage` is a *different*
   API for a *different* product — see [§6](#6-consoleapi-usage-optional---console-usage) — this doesn't contradict the point above.)
 - **`--console-usage` needs network access and an Admin API key.**
-  Everything else in this tool is local file I/O; this one flag calls
+  Everything else in this tool is local file I/O; this flag calls
   `api.anthropic.com`. If `ANTHROPIC_ADMIN_KEY` isn't set, or the key
   isn't an Admin key, it fails with a clear error before writing
-  anything.
+  anything. It also fetches `pricing.json` from
+  `github.com/alacava/claude-api-exporter` for the `Cost by API Key`
+  sheet's estimates — if that fetch fails, it falls back to a local
+  cache and, failing that, just skips estimates (a warning is printed,
+  nothing else breaks).
 - **Privacy.** The exports contain employee emails and usage data.
   The included `.gitignore` excludes `*.csv` and `*.xlsx` so you don't
   accidentally commit them.

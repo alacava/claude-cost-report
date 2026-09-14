@@ -18,9 +18,15 @@ seat cost.
 
 Optionally, --console-usage pulls platform.claude.com (Claude Console /
 Claude Platform API) cost data via the Admin API and adds it as its own
-"Console API Usage" sheet. This is a SEPARATE billing relationship from
-Team seats (pay-as-you-go API usage, not tied to named Team members), so
-it is never blended into Per-User Cost — see CLAUDE.md.
+"Console API Usage" sheet, plus a "Cost by API Key" sheet breaking that
+same spend down by key where the Cost API's workspace-only grouping
+allows it to be attributed exactly (see build_key_cost_df). Where it
+can't be split exactly, that sheet adds a pricing-based ESTIMATE (tokens
+× rates from a third-party pricing.json — Anthropic publishes no
+machine-readable pricing source — never a billed figure) instead of
+leaving the row blank; see estimate_cost_usd. This is a SEPARATE billing
+relationship from Team seats (pay-as-you-go API usage, not tied to named
+Team members), so it is never blended into Per-User Cost — see CLAUDE.md.
 
 Usage:
     python3 claude_team_cost_report.py <export.csv> [options]
@@ -204,6 +210,291 @@ def build_console_df(rows, workspace_names: dict) -> pd.DataFrame:
               .reset_index(drop=True))[cols]
 
 
+def fetch_console_api_keys(admin_key: str) -> dict:
+    """Map api_key_id -> {name, workspace_id, status} via the Admin API.
+    Fetches all statuses (not just active) so historical usage from an
+    since-archived key still gets a name instead of a bare ID."""
+    keys = {}
+    after = None
+    while True:
+        params = [("limit", 1000)]
+        if after:
+            params.append(("after_id", after))
+        data = _console_api_get(admin_key, "/v1/organizations/api_keys", params)
+        for k in data.get("data", []):
+            keys[k["id"]] = {
+                "name": k.get("name") or k["id"],
+                # legacy top-level workspace_id (not `scope`): null both for
+                # the default workspace and for org-scoped keys, matching
+                # how cost/usage reports represent the default workspace.
+                "workspace_id": k.get("workspace_id"),
+                "status": k.get("status"),
+            }
+        after = data.get("last_id")
+        if not data.get("has_more") or not after:
+            break
+    return keys
+
+
+def fetch_console_usage_report(admin_key: str, start_date: str, end_date: str):
+    """Pull the Admin API messages usage report for [start_date, end_date],
+    grouped by workspace, API key, model, and service tier. Returns a flat
+    list of per-item token dicts (token subtypes kept separate, not summed —
+    they price differently) across all daily buckets and pages. Note: this
+    is a SEPARATE endpoint from the Cost Report and gives tokens, not
+    dollars — the Cost Report can't be grouped by api_key_id at all, which
+    is why per-key $ has to be derived rather than pulled directly (see
+    build_key_cost_df / estimate_cost_usd)."""
+    starting_at = f"{start_date}T00:00:00Z"
+    ending_at_date = date.fromisoformat(end_date) + timedelta(days=1)
+    ending_at = f"{ending_at_date.isoformat()}T00:00:00Z"
+
+    rows = []
+    page = None
+    while True:
+        params = [("starting_at", starting_at), ("ending_at", ending_at),
+                  ("group_by[]", "workspace_id"), ("group_by[]", "api_key_id"),
+                  ("group_by[]", "model"), ("group_by[]", "service_tier"),
+                  ("bucket_width", "1d"), ("limit", 31)]
+        if page:
+            params.append(("page", page))
+        data = _console_api_get(admin_key, "/v1/organizations/usage_report/messages",
+                                params)
+        for bucket in data.get("data", []):
+            for item in bucket.get("results", []):
+                cache_creation = item.get("cache_creation") or {}
+                rows.append({
+                    "workspace_id": item.get("workspace_id"),
+                    "api_key_id": item.get("api_key_id"),
+                    "model": item.get("model"),
+                    "service_tier": item.get("service_tier"),
+                    "uncached_input_tokens": item.get("uncached_input_tokens", 0),
+                    "cache_read_input_tokens": item.get("cache_read_input_tokens", 0),
+                    "cache_5m_tokens": cache_creation.get(
+                        "ephemeral_5m_input_tokens", 0),
+                    "cache_1h_tokens": cache_creation.get(
+                        "ephemeral_1h_input_tokens", 0),
+                    "output_tokens": item.get("output_tokens", 0),
+                })
+        page = data.get("next_page")
+        if not data.get("has_more") or not page:
+            break
+    return rows
+
+
+PRICING_URL = ("https://raw.githubusercontent.com/alacava/"
+              "claude-api-exporter/main/pricing.json")
+PRICING_CACHE_PATH = Path(".pricing_cache.json")
+
+
+def fetch_model_pricing(cache_path: Path = PRICING_CACHE_PATH):
+    """Best-effort fetch of claude-api-exporter's pricing.json (USD per
+    million tokens, by model — see that repo). Anthropic itself publishes
+    NO machine-readable pricing source (only prose docs pages), so this is
+    the closest thing available and is a third-party/self-maintained
+    approximation, not an official rate card — never billing-accurate.
+    Falls back to a local cache on network failure; returns None (meaning
+    "skip estimates") if neither is available. Never sys.exit — this is a
+    supplementary feature, and the rest of the report must still work."""
+    req = urllib.request.Request(PRICING_URL, headers={
+        "User-Agent": "claude-cost-report/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pricing = json.load(resp)
+        try:
+            cache_path.write_text(json.dumps(pricing))
+        except OSError:
+            pass
+        return pricing
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            json.JSONDecodeError, ValueError) as e:
+        print(f"Warning: could not fetch live pricing from {PRICING_URL} "
+              f"({e}).", file=sys.stderr)
+        if cache_path.is_file():
+            try:
+                print(f"Using cached pricing at {cache_path}.", file=sys.stderr)
+                return json.loads(cache_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+        print("No pricing available (no cache either) — per-key cost "
+              "ESTIMATES for shared workspaces will be skipped; exact $ "
+              "figures elsewhere are unaffected.", file=sys.stderr)
+        return None
+
+
+def estimate_cost_usd(pricing: dict, model, service_tier, uncached_input,
+                      cache_read, cache_5m, cache_1h, output) -> float:
+    """Approximate USD cost from token counts + pricing.json rates. Known
+    simplifications (documented, not silently swept under the rug):
+    - 1h cache writes are billed at the 5m cache_write rate — pricing.json
+      only carries one cache_write rate per model, not 2x for 1h as
+      Anthropic's real pricing does.
+    - Batch API's flat 50% discount is applied here (hardcoded — it's a
+      stable, documented rule, not something pricing.json needs to carry).
+    - inference_geo's 1.1x "us" multiplier is NOT applied (usage isn't
+      grouped by geo here) — a small underestimate for US-pinned traffic.
+    - priority/flex service tiers use standard rates (their real pricing
+      differs and isn't in pricing.json) — likely inaccurate for those."""
+    models = pricing.get("models", {})
+    rate = models.get(model) or models.get("default") or {}
+    cost = (uncached_input * rate.get("input", 0.0)
+           + cache_read * rate.get("cache_read", 0.0)
+           + (cache_5m + cache_1h) * rate.get("cache_write", 0.0)
+           + output * rate.get("output", 0.0)) / 1_000_000
+    if service_tier == "batch":
+        cost *= 0.5
+    return cost
+
+
+_NO_WORKSPACE = "__default_workspace__"
+_NO_API_KEY = "__no_api_key__"
+
+
+_USAGE_TOKEN_COLS = ["uncached_input_tokens", "cache_read_input_tokens",
+                    "cache_5m_tokens", "cache_1h_tokens", "output_tokens"]
+
+
+def build_key_cost_df(usage_rows, cost_rows, api_keys: dict,
+                      workspace_names: dict, pricing: dict = None) -> pd.DataFrame:
+    """One row per API key (or non-key usage source) with token totals for
+    the period, an exact dollar Amount ONLY where attributable, and a
+    separate Estimated Amount (token × pricing.json rate) that fills in
+    ONLY the rows the exact amount left blank — never both, never in place
+    of an exact figure.
+
+    The Cost Report endpoint can only be grouped by workspace_id, never by
+    api_key_id — Anthropic's API has no per-key cost breakdown. So: if a
+    workspace's entire cost for the period traces to exactly one usage
+    source (one API key, or Console/Playground usage with no key), that
+    source gets the workspace's exact cost, no estimate needed. If a
+    workspace has multiple usage sources, none of them gets an exact
+    per-row dollar figure — that would require guessing how to split a
+    shared total — and instead a single workspace-total row carries the
+    (still exact) combined dollar amount; the per-key rows instead get
+    `estimated_amount_usd` from `estimate_cost_usd` when `pricing` is
+    given (None if not, e.g. pricing.json was unreachable)."""
+    cols = ["api_key_name", "api_key_id", "workspace", "input_tokens",
+            "output_tokens", "total_tokens", "amount_usd",
+            "estimated_amount_usd", "note"]
+    if not usage_rows and not cost_rows:
+        return pd.DataFrame(columns=cols)
+
+    udf = pd.DataFrame(usage_rows) if usage_rows else pd.DataFrame(
+        columns=["workspace_id", "api_key_id", "model", "service_tier"]
+                + _USAGE_TOKEN_COLS)
+    udf["workspace_id"] = udf["workspace_id"].fillna(_NO_WORKSPACE)
+    udf["api_key_id"] = udf["api_key_id"].fillna(_NO_API_KEY)
+
+    # display token totals, collapsed across model/service_tier
+    ugrp = (udf.groupby(["workspace_id", "api_key_id"], as_index=False)
+               .agg(**{c: (c, "sum") for c in _USAGE_TOKEN_COLS}))
+    ugrp["input_tokens"] = (ugrp["uncached_input_tokens"]
+                            + ugrp["cache_read_input_tokens"]
+                            + ugrp["cache_5m_tokens"] + ugrp["cache_1h_tokens"])
+    ugrp["total_tokens"] = ugrp["input_tokens"] + ugrp["output_tokens"]
+
+    # estimated $ per (workspace, key), kept at model/service_tier
+    # granularity until summed, since rates and the batch discount vary by
+    # both — collapsing first would mix rates together and be wrong
+    est_by_key, unpriced_models_by_key = {}, {}
+    if pricing is not None:
+        mgrp = (udf.groupby(["workspace_id", "api_key_id", "model",
+                             "service_tier"], as_index=False)
+                   .agg(**{c: (c, "sum") for c in _USAGE_TOKEN_COLS}))
+        known_models = set(pricing.get("models", {})) - {"default"}
+        for _, r in mgrp.iterrows():
+            k = (r["workspace_id"], r["api_key_id"])
+            est_by_key[k] = est_by_key.get(k, 0.0) + estimate_cost_usd(
+                pricing, r["model"], r["service_tier"],
+                r["uncached_input_tokens"], r["cache_read_input_tokens"],
+                r["cache_5m_tokens"], r["cache_1h_tokens"], r["output_tokens"])
+            if r["model"] not in known_models:
+                unpriced_models_by_key.setdefault(k, set()).add(r["model"])
+
+    cdf = pd.DataFrame(cost_rows) if cost_rows else pd.DataFrame(
+        columns=["workspace_id", "amount_usd"])
+    if len(cdf):
+        cdf["workspace_id"] = cdf["workspace_id"].fillna(_NO_WORKSPACE)
+    cost_by_ws = (cdf.groupby("workspace_id")["amount_usd"].sum().to_dict()
+                 if len(cdf) else {})
+
+    def ws_name(w):
+        return "Default workspace" if w == _NO_WORKSPACE else workspace_names.get(w, w)
+
+    def key_label(k):
+        if k == _NO_API_KEY:
+            return "Console/Playground (no API key)", "—"
+        info = api_keys.get(k)
+        return (info["name"] if info else k), k
+
+    def estimate_note_suffix(w, k):
+        if pricing is None:
+            return " (no estimate — pricing.json unavailable this run)"
+        if (w, k) in unpriced_models_by_key:
+            return (" (estimate uses a fallback 'default' rate for "
+                    f"{', '.join(sorted(unpriced_models_by_key[(w, k)]))} "
+                    "— not in pricing.json)")
+        return ""
+
+    rows_out = []
+    for w in sorted(set(ugrp["workspace_id"]) | set(cost_by_ws.keys())):
+        units = ugrp[ugrp["workspace_id"] == w]
+        ws_cost = cost_by_ws.get(w, 0.0)
+        n_units = len(units)
+        if n_units == 0:
+            rows_out.append({
+                "api_key_name": "— (non-token cost, e.g. code execution)",
+                "api_key_id": "—", "workspace": ws_name(w),
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "amount_usd": ws_cost, "estimated_amount_usd": None,
+                "note": "No API-key-attributable token usage found for this "
+                        "workspace's cost (e.g. code execution isn't in the "
+                        "usage report) — full workspace cost shown",
+            })
+        elif n_units == 1:
+            u = units.iloc[0]
+            name, kid = key_label(u["api_key_id"])
+            rows_out.append({
+                "api_key_name": name, "api_key_id": kid, "workspace": ws_name(w),
+                "input_tokens": u["input_tokens"],
+                "output_tokens": u["output_tokens"],
+                "total_tokens": u["total_tokens"], "amount_usd": ws_cost,
+                "estimated_amount_usd": None,
+                "note": "Exact — sole usage source in this workspace this period",
+            })
+        else:
+            for _, u in units.iterrows():
+                name, kid = key_label(u["api_key_id"])
+                est = est_by_key.get((w, u["api_key_id"]))
+                rows_out.append({
+                    "api_key_name": name, "api_key_id": kid,
+                    "workspace": ws_name(w),
+                    "input_tokens": u["input_tokens"],
+                    "output_tokens": u["output_tokens"],
+                    "total_tokens": u["total_tokens"], "amount_usd": None,
+                    "estimated_amount_usd": est,
+                    "note": f"{n_units} usage sources shared this workspace's "
+                            "cost this period — exact $ can't be split per key "
+                            "by the Cost API (see workspace total row below). "
+                            "Estimated Amount (USD) is tokens × pricing.json, "
+                            "an approximation, not a billed figure"
+                            + estimate_note_suffix(w, u["api_key_id"]),
+                })
+            rows_out.append({
+                "api_key_name": f"— WORKSPACE TOTAL ({n_units} sources) —",
+                "api_key_id": "—", "workspace": ws_name(w),
+                "input_tokens": units["input_tokens"].sum(),
+                "output_tokens": units["output_tokens"].sum(),
+                "total_tokens": units["total_tokens"].sum(), "amount_usd": ws_cost,
+                "estimated_amount_usd": None,
+                "note": f"Exact — sum across {n_units} usage sources",
+            })
+
+    df = pd.DataFrame(rows_out, columns=cols)
+    return df.sort_values(["amount_usd", "estimated_amount_usd"],
+                          ascending=False, na_position="last").reset_index(drop=True)
+
+
 def load_roster(path: Path):
     r = pd.read_csv(path)
     need = {"Email", "Seat Tier"}
@@ -266,7 +557,8 @@ def normalize(df, fmt, roster):
 
 
 def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
-               roster_used, console_df=None, console_period=None):
+               roster_used, console_df=None, console_period=None,
+               key_cost_df=None):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -326,6 +618,13 @@ def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
             "billing relationship from Team seats, not tied to named members. "
             "Shown on its own 'Console API Usage' sheet, NOT included in the "
             "Per-User Cost TOTAL above.")
+    if key_cost_df is not None and len(key_cost_df):
+        notes.append(
+            "'Cost by API Key' sheet: per-key $ is exact only where a "
+            "workspace's whole cost traced to one key/source this period — "
+            "Anthropic's Cost API cannot be grouped by API key at all, so "
+            "shared-workspace amounts are shown once as a flagged workspace "
+            "total rather than split by guesswork; see that sheet's notes.")
     ws.cell(9, 1, "Legend / how to use").font = bold
     for i, n in enumerate(notes):
         ws.cell(10 + i, 1, n).font = base
@@ -472,6 +771,59 @@ def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
         for i, w in enumerate([30, 24, 16, 14, 16], 1):
             ws4.column_dimensions[get_column_letter(i)].width = w
 
+    if key_cost_df is not None and len(key_cost_df):
+        ws5 = wb.create_sheet("Cost by API Key")
+        ws5["A1"] = f"Console/API cost by API key — {console_period}"
+        ws5["A1"].font = Font(name=A, bold=True, size=13)
+        ws5["A2"] = ("The Cost API only breaks costs down by workspace, never "
+                     "by API key. Amount (USD) is exact only where a "
+                     "workspace's whole cost traces to one usage source this "
+                     "period; shared-workspace rows are left blank there but "
+                     "get an Estimated Amount (USD) instead — tokens × "
+                     "pricing.json rates, NOT a billed figure — and a "
+                     "flagged workspace-total row carries the (still exact) "
+                     "combined amount. Read the Note column per row.")
+        ws5["A2"].font = base
+        ws5["A2"].alignment = Alignment(wrap_text=True)
+        ws5.merge_cells("A2:I2")
+        ws5.row_dimensions[2].height = 40
+        hdr_row = 4
+        k_headers = ["API Key Name", "API Key ID", "Workspace", "Input Tokens",
+                     "Output Tokens", "Total Tokens", "Amount (USD)",
+                     "Estimated Amount (USD)", "Note"]
+        for col, h in enumerate(k_headers, 1):
+            c = ws5.cell(hdr_row, col, h)
+            c.font, c.fill = hdr_font, hdr_fill
+            c.alignment = Alignment(horizontal="center", vertical="center",
+                                    wrap_text=True)
+        ws5.freeze_panes = f"A{hdr_row + 1}"
+        for i, row in key_cost_df.reset_index(drop=True).iterrows():
+            r = hdr_row + 1 + i
+            is_total_row = str(row["api_key_name"]).startswith("— WORKSPACE TOTAL")
+            vals = [row["api_key_name"], row["api_key_id"], row["workspace"],
+                    int(row["input_tokens"]), int(row["output_tokens"]),
+                    int(row["total_tokens"]),
+                    row["amount_usd"] if pd.notna(row["amount_usd"]) else None,
+                    (row["estimated_amount_usd"]
+                     if pd.notna(row["estimated_amount_usd"]) else None),
+                    row["note"]]
+            for col, v in enumerate(vals, 1):
+                c = ws5.cell(r, col, v)
+                c.font = bold if is_total_row else base
+                c.border = thin
+                if col == 9:
+                    c.alignment = Alignment(wrap_text=True)
+                if not is_total_row and i % 2:
+                    c.fill = gray
+        for r in range(hdr_row + 1, hdr_row + 1 + len(key_cost_df)):
+            ws5.cell(r, 4).number_format = "#,##0"
+            ws5.cell(r, 5).number_format = "#,##0"
+            ws5.cell(r, 6).number_format = "#,##0"
+            ws5.cell(r, 7).number_format = money
+            ws5.cell(r, 8).number_format = money
+        for i, w in enumerate([28, 22, 24, 13, 13, 13, 14, 18, 46], 1):
+            ws5.column_dimensions[get_column_letter(i)].width = w
+
     wb.save(out_path)
 
 
@@ -535,7 +887,7 @@ def main():
               "--roster <members-analytics.csv> to include zero-usage seats "
               "and real seat tiers.")
 
-    console_df, console_period = None, None
+    console_df, console_period, key_cost_df = None, None, None
     if args.console_usage:
         admin_key = os.environ.get("ANTHROPIC_ADMIN_KEY")
         if not admin_key:
@@ -555,9 +907,9 @@ def main():
         console_period = f"{c_start} to {c_end}"
         print(f"\nFetching Console/API usage from platform.claude.com for "
               f"{console_period} ...")
-        rows = fetch_console_cost_report(admin_key, c_start, c_end)
+        cost_rows = fetch_console_cost_report(admin_key, c_start, c_end)
         ws_names = fetch_console_workspace_names(admin_key)
-        console_df = build_console_df(rows, ws_names)
+        console_df = build_console_df(cost_rows, ws_names)
 
         total_console = console_df["amount_usd"].sum() if len(console_df) else 0.0
         print(f"\nConsole/API (platform.claude.com) usage — {console_period}")
@@ -570,12 +922,26 @@ def main():
                 print(f"  ${t['amount_usd']:>7,.2f}  {t['workspace']}  "
                       f"{t['model']} / {t['cost_type']}")
 
+        print("\nFetching per-API-key usage (Admin API) ...")
+        usage_rows = fetch_console_usage_report(admin_key, c_start, c_end)
+        api_keys = fetch_console_api_keys(admin_key)
+        pricing = fetch_model_pricing()
+        key_cost_df = build_key_cost_df(usage_rows, cost_rows, api_keys, ws_names,
+                                        pricing=pricing)
+        if len(key_cost_df):
+            exact = key_cost_df["amount_usd"].notna().sum()
+            estimated = key_cost_df["estimated_amount_usd"].notna().sum()
+            print(f"Cost by API Key: {len(key_cost_df)} rows, {exact} with an "
+                  f"exact dollar amount, {estimated} with a pricing-based "
+                  "estimate (see the 'Cost by API Key' sheet notes).")
+
     if not args.no_xlsx:
         out = args.out or args.csv.with_name(
             f"claude-team-per-user-cost_{period.replace(' ', '_')}.xlsx")
         build_xlsx(users, detail, out, args.seat_price, args.premium_price,
                    period, fmt, roster is not None,
-                   console_df=console_df, console_period=console_period)
+                   console_df=console_df, console_period=console_period,
+                   key_cost_df=key_cost_df)
         print(f"\nWrote {out}")
         print("Note: open once in Excel/LibreOffice so formulas calculate "
               "(values are formula-driven, not cached).")

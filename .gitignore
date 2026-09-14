@@ -8,3 +8,4 @@ __pycache__/
 venv/
 CLAUDE.md
 .env
+.pricing_cache.json

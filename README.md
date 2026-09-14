@@ -138,6 +138,9 @@ python3 claude_team_cost_report.py members-analytics-<org>-....csv
 | `--premium-price N` | `150.00` | Price per **Premium** seat, if any appear in your roster |
 | `--out FILE` | derived from input filename | Output `.xlsx` path |
 | `--no-xlsx` | off | Console summary only, skip the workbook |
+| `--console-usage` | off | Also fetch `platform.claude.com` (Console/API) cost data via the Admin API and add it as its own sheet — see [§6](#6-consoleapi-usage-optional---console-usage) |
+| `--console-start DATE` | same period as the input filename | Start date (`YYYY-MM-DD`) for the Console/API pull |
+| `--console-end DATE` | same period as the input filename | End date (`YYYY-MM-DD`) for the Console/API pull |
 
 Seat pricing is an input **you** provide — no export contains it, and
 Anthropic's prices can change. Verify current pricing at
@@ -178,6 +181,7 @@ python3 claude_team_cost_report.py spend.csv --roster members.csv \
 | **Assumptions** | Seat prices in editable yellow input cells. Change `B5` (Standard) or `B6` (Premium) and every cost formula recalculates — no need to rerun the script for a price change |
 | **Per-User Cost** | One row per member: seat tier, requests, usage spend, seat fee (formula driven by Assumptions), total cost, % of total, with a totals row |
 | **By Product & Model** | (spend-report input only) The full breakdown: requests, prompt/completion tokens, net and gross spend per user/product/model |
+| **Console API Usage** | (only with `--console-usage`) Workspace / model / cost-type breakdown of `platform.claude.com` API spend, with a totals row. Kept separate from Per-User Cost — see [§6](#6-consoleapi-usage-optional---console-usage) |
 
 Seat fees, totals, and percentages are live formulas, not hardcoded
 values. Open the file once in Excel or LibreOffice so the formulas
@@ -202,7 +206,59 @@ per-user total = seat fee (by seat tier, from your inputs)
 
 ---
 
-## 6. Caveats & gotchas
+## 6. Console/API usage (optional, `--console-usage`)
+
+Team seat fees and Cowork/Chat usage spend are one billing relationship.
+If your org also has developers calling the API directly through
+**Claude Console** (`platform.claude.com`) — pay-as-you-go, billed by
+API key/workspace — that's a **separate** billing relationship, not
+covered by the Team analytics exports at all. `--console-usage` fetches
+that data too, via the Console [Admin
+API](https://platform.claude.com/docs/en/manage-claude/usage-cost-api),
+so one workbook can show the complete picture.
+
+### Setup
+
+1. In [Claude Console](https://platform.claude.com) → **Settings →
+   Admin API keys**, create an Admin API key (starts with
+   `sk-ant-admin01-...`). You need to be an org admin.
+2. Export it as an environment variable — never pass it on the command
+   line (it'll end up in your shell history):
+
+   ```bash
+   export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
+   ```
+
+### Running it
+
+```bash
+python3 claude_team_cost_report.py \
+    spend-report-<org>-2026-08-01-to-2026-08-31.csv \
+    --roster members-analytics-<org>-2026-08-15-to-2026-09-13.csv \
+    --console-usage
+```
+
+By default it pulls the same date range as the Team CSV's filename.
+Pass `--console-start`/`--console-end` to use a different window.
+
+### What you get
+
+A **Console API Usage** sheet: spend broken out by workspace, model,
+cost type (tokens / web search / code execution), and service tier,
+with a totals row — plus the same breakdown's top lines and grand
+total printed to the console.
+
+**This total is *not* added into Per-User Cost or its TOTAL row.**
+Console/API usage is billed by API key and workspace, not by named
+Team member, so there's no reliable way to attribute it to a person —
+attempting to fold it into the per-user total would silently misstate
+individual costs. The two totals are shown side by side (console
+output and the Assumptions sheet notes) so you can see the org's full
+Claude spend, without pretending they're the same kind of number.
+
+---
+
+## 7. Caveats & gotchas
 
 - **90-day lookback ceiling.** The spend export can't reach further
   back than 90 days, so run this monthly and archive the CSVs if you
@@ -217,14 +273,20 @@ per-user total = seat fee (by seat tier, from your inputs)
   reflect current seats.
 - **No API on Team.** The Analytics API requires the Enterprise plan;
   on Team, the CSV export is the only way to get this data out, so
-  the download step stays manual.
+  the download step stays manual. (`--console-usage` is a *different*
+  API for a *different* product — see [§6](#6-consoleapi-usage-optional---console-usage) — this doesn't contradict the point above.)
+- **`--console-usage` needs network access and an Admin API key.**
+  Everything else in this tool is local file I/O; this one flag calls
+  `api.anthropic.com`. If `ANTHROPIC_ADMIN_KEY` isn't set, or the key
+  isn't an Admin key, it fails with a clear error before writing
+  anything.
 - **Privacy.** The exports contain employee emails and usage data.
   The included `.gitignore` excludes `*.csv` and `*.xlsx` so you don't
   accidentally commit them.
 
 ---
 
-## 7. Repo layout
+## 8. Repo layout
 
 ```
 claude_team_cost_report.py   the tool (stdlib + pandas + openpyxl)

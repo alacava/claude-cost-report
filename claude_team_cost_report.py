@@ -16,6 +16,12 @@ summary + an .xlsx with live formulas. With a spend report, a
 export as --roster so zero-usage seat holders still appear with their
 seat cost.
 
+Optionally, --console-usage pulls platform.claude.com (Claude Console /
+Claude Platform API) cost data via the Admin API and adds it as its own
+"Console API Usage" sheet. This is a SEPARATE billing relationship from
+Team seats (pay-as-you-go API usage, not tied to named Team members), so
+it is never blended into Per-User Cost — see CLAUDE.md.
+
 Usage:
     python3 claude_team_cost_report.py <export.csv> [options]
 
@@ -27,16 +33,31 @@ Options:
     --premium-price N   Price per Premium seat (default 150.00 monthly)
     --out FILE          Output .xlsx path (default: derived from input name)
     --no-xlsx           Console summary only
+    --console-usage     Also fetch platform.claude.com cost data via the
+                        Admin API (requires ANTHROPIC_ADMIN_KEY env var)
+    --console-start DATE  Start date (YYYY-MM-DD) for Console/API data;
+                        default: same period as the Team CSV filename
+    --console-end DATE  End date (YYYY-MM-DD) for Console/API data;
+                        default: same period as the Team CSV filename
 
 Requires: pandas, openpyxl
 """
 
 import argparse
+import json
+import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+ANTHROPIC_API_BASE = "https://api.anthropic.com"
+ANTHROPIC_VERSION = "2023-06-01"
 
 MEMBERS_SPEND = "Estimated Spend (USD)"
 SPEND_NET = "total_net_spend_usd"
@@ -62,9 +83,104 @@ def seat_fee(tier: str, std: float, prem: float) -> float:
     return 0.0  # Unassigned / unknown tiers carry no seat fee
 
 
-def period_from_filename(path: Path) -> str:
+def parse_period_dates(path: Path):
+    """Return (start, end) YYYY-MM-DD strings from an export filename, or
+    (None, None) if the filename doesn't carry a date range."""
     m = re.search(r"(\d{4}-\d{2}-\d{2})-to-(\d{4}-\d{2}-\d{2})", path.name)
-    return f"{m.group(1)} to {m.group(2)}" if m else "unknown (not in filename)"
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def period_from_filename(path: Path) -> str:
+    start, end = parse_period_dates(path)
+    return f"{start} to {end}" if start else "unknown (not in filename)"
+
+
+def _console_api_get(admin_key: str, path: str, params) -> dict:
+    """GET against the Console Admin API (platform.claude.com), stdlib-only."""
+    url = f"{ANTHROPIC_API_BASE}{path}?{urllib.parse.urlencode(params, doseq=True)}"
+    req = urllib.request.Request(url, headers={
+        "x-api-key": admin_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "User-Agent": "claude-cost-report/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        sys.exit(f"Console/API request to {path} failed: HTTP {e.code}\n{body}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Console/API request to {path} failed: {e.reason}")
+
+
+def fetch_console_cost_report(admin_key: str, start_date: str, end_date: str):
+    """Pull the Admin API cost report for [start_date, end_date] (inclusive
+    calendar days). Returns a flat list of per-item cost dicts across all
+    daily buckets and pages."""
+    starting_at = f"{start_date}T00:00:00Z"
+    ending_at_date = date.fromisoformat(end_date) + timedelta(days=1)
+    ending_at = f"{ending_at_date.isoformat()}T00:00:00Z"
+
+    rows = []
+    page = None
+    while True:
+        params = [("starting_at", starting_at), ("ending_at", ending_at),
+                  ("group_by[]", "workspace_id"), ("group_by[]", "description"),
+                  ("limit", 31)]
+        if page:
+            params.append(("page", page))
+        data = _console_api_get(admin_key, "/v1/organizations/cost_report", params)
+        for bucket in data.get("data", []):
+            for item in bucket.get("results", []):
+                rows.append({
+                    "workspace_id": item.get("workspace_id"),
+                    "model": item.get("model"),
+                    "cost_type": item.get("cost_type"),
+                    "service_tier": item.get("service_tier"),
+                    # amount is a decimal string in the currency's lowest
+                    # unit (cents for USD): "123.45" == $1.23
+                    "amount_usd": float(item.get("amount", 0)) / 100.0,
+                })
+        page = data.get("next_page")
+        if not data.get("has_more") or not page:
+            break
+    return rows
+
+
+def fetch_console_workspace_names(admin_key: str) -> dict:
+    """Map workspace_id -> display name via the Admin API (best-effort)."""
+    names = {}
+    after = None
+    while True:
+        params = [("limit", 1000), ("include_archived", "true")]
+        if after:
+            params.append(("after_id", after))
+        data = _console_api_get(admin_key, "/v1/organizations/workspaces", params)
+        for ws in data.get("data", []):
+            names[ws["id"]] = ws.get("name") or ws["id"]
+        after = data.get("last_id")
+        if not data.get("has_more") or not after:
+            break
+    return names
+
+
+def build_console_df(rows, workspace_names: dict) -> pd.DataFrame:
+    """Aggregate raw cost-report line items into one row per
+    workspace/model/cost_type/service_tier, sorted by spend descending."""
+    cols = ["workspace", "model", "cost_type", "service_tier", "amount_usd"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    df["workspace"] = df["workspace_id"].apply(
+        lambda w: workspace_names.get(w, w) if pd.notna(w) else "Default workspace")
+    df["model"] = df["model"].fillna("—")
+    df["cost_type"] = df["cost_type"].fillna("—")
+    df["service_tier"] = df["service_tier"].fillna("—")
+    return (df.groupby(["workspace", "model", "cost_type", "service_tier"],
+                       as_index=False)
+              .agg(amount_usd=("amount_usd", "sum"))
+              .sort_values("amount_usd", ascending=False)
+              .reset_index(drop=True))[cols]
 
 
 def load_roster(path: Path):
@@ -129,7 +245,7 @@ def normalize(df, fmt, roster):
 
 
 def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
-               roster_used):
+               roster_used, console_df=None, console_period=None):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -182,6 +298,13 @@ def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
         notes.append("Seat tiers assumed Standard for every user in the spend "
                      "report — rerun with --roster <members-analytics.csv> for "
                      "actual tiers and zero-usage members.")
+    if console_df is not None:
+        notes.append(
+            f"Console/API (platform.claude.com) spend for {console_period}: "
+            f"${console_df['amount_usd'].sum():,.2f} — a separate pay-as-you-go "
+            "billing relationship from Team seats, not tied to named members. "
+            "Shown on its own 'Console API Usage' sheet, NOT included in the "
+            "Per-User Cost TOTAL above.")
     ws.cell(9, 1, "Legend / how to use").font = bold
     for i, n in enumerate(notes):
         ws.cell(10 + i, 1, n).font = base
@@ -291,6 +414,43 @@ def build_xlsx(users, detail, out_path, std_price, prem_price, period, fmt,
         for i, w in enumerate([34, 14, 26, 10, 15, 16, 14, 14], 1):
             ws3.column_dimensions[get_column_letter(i)].width = w
 
+    if console_df is not None and len(console_df):
+        ws4 = wb.create_sheet("Console API Usage")
+        ws4["A1"] = f"Console/API (platform.claude.com) usage — {console_period}"
+        ws4["A1"].font = Font(name=A, bold=True, size=13)
+        ws4["A2"] = ("Separate billing relationship from Team seats (Admin API "
+                     "cost report) — not blended into Per-User Cost.")
+        ws4["A2"].font = base
+        hdr_row = 4
+        c_headers = ["Workspace", "Model", "Cost Type", "Service Tier",
+                     "Amount (USD)"]
+        for col, h in enumerate(c_headers, 1):
+            c = ws4.cell(hdr_row, col, h)
+            c.font, c.fill = hdr_font, hdr_fill
+            c.alignment = Alignment(horizontal="center", vertical="center",
+                                    wrap_text=True)
+        ws4.freeze_panes = f"A{hdr_row + 1}"
+        for i, row in console_df.reset_index(drop=True).iterrows():
+            r = hdr_row + 1 + i
+            vals = [row["workspace"], row["model"], row["cost_type"],
+                    row["service_tier"], row["amount_usd"]]
+            for col, v in enumerate(vals, 1):
+                c = ws4.cell(r, col, v)
+                c.font, c.border = base, thin
+                if i % 2:
+                    c.fill = gray
+        ctr = hdr_row + 1 + len(console_df)
+        ws4.cell(ctr, 1, "TOTAL").font = bold
+        AL = get_column_letter(5)
+        ws4.cell(ctr, 5,
+                 f"=SUM({AL}{hdr_row + 1}:{AL}{ctr - 1})").font = bold
+        for col in range(1, 6):
+            ws4.cell(ctr, col).border = top
+        for r in range(hdr_row + 1, ctr + 1):
+            ws4.cell(r, 5).number_format = money
+        for i, w in enumerate([30, 24, 16, 14, 16], 1):
+            ws4.column_dimensions[get_column_letter(i)].width = w
+
     wb.save(out_path)
 
 
@@ -303,6 +463,15 @@ def main():
     ap.add_argument("--premium-price", type=float, default=150.0)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-xlsx", action="store_true")
+    ap.add_argument("--console-usage", action="store_true",
+                    help="Also fetch platform.claude.com (Console/API) cost "
+                         "data via the Admin API (needs ANTHROPIC_ADMIN_KEY)")
+    ap.add_argument("--console-start", type=str, default=None,
+                    help="Start date YYYY-MM-DD for Console/API data "
+                         "(default: same period as the Team CSV filename)")
+    ap.add_argument("--console-end", type=str, default=None,
+                    help="End date YYYY-MM-DD for Console/API data "
+                         "(default: same period as the Team CSV filename)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -344,11 +513,47 @@ def main():
               "--roster <members-analytics.csv> to include zero-usage seats "
               "and real seat tiers.")
 
+    console_df, console_period = None, None
+    if args.console_usage:
+        admin_key = os.environ.get("ANTHROPIC_ADMIN_KEY")
+        if not admin_key:
+            sys.exit("--console-usage requires the ANTHROPIC_ADMIN_KEY "
+                     "environment variable (an Admin API key, "
+                     "sk-ant-admin01-..., from platform.claude.com > "
+                     "Settings > Admin API keys).")
+        c_start = args.console_start
+        c_end = args.console_end
+        if not c_start or not c_end:
+            f_start, f_end = parse_period_dates(args.csv)
+            c_start, c_end = c_start or f_start, c_end or f_end
+        if not c_start or not c_end:
+            sys.exit("Could not determine a date range for --console-usage "
+                     "(the CSV filename has none); pass --console-start "
+                     "and --console-end explicitly.")
+        console_period = f"{c_start} to {c_end}"
+        print(f"\nFetching Console/API usage from platform.claude.com for "
+              f"{console_period} ...")
+        rows = fetch_console_cost_report(admin_key, c_start, c_end)
+        ws_names = fetch_console_workspace_names(admin_key)
+        console_df = build_console_df(rows, ws_names)
+
+        total_console = console_df["amount_usd"].sum() if len(console_df) else 0.0
+        print(f"\nConsole/API (platform.claude.com) usage — {console_period}")
+        print(f"Total Console/API spend: ${total_console:,.2f}  "
+              "(separate billing relationship from Team seats above — not "
+              "included in the TOTAL there)")
+        if len(console_df):
+            print("Top spend lines (workspace / model / cost type):")
+            for _, t in console_df.head(5).iterrows():
+                print(f"  ${t['amount_usd']:>7,.2f}  {t['workspace']}  "
+                      f"{t['model']} / {t['cost_type']}")
+
     if not args.no_xlsx:
         out = args.out or args.csv.with_name(
             f"claude-team-per-user-cost_{period.replace(' ', '_')}.xlsx")
         build_xlsx(users, detail, out, args.seat_price, args.premium_price,
-                   period, fmt, roster is not None)
+                   period, fmt, roster is not None,
+                   console_df=console_df, console_period=console_period)
         print(f"\nWrote {out}")
         print("Note: open once in Excel/LibreOffice so formulas calculate "
               "(values are formula-driven, not cached).")

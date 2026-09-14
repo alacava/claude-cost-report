@@ -28,9 +28,8 @@ Usage:
 Options:
     --roster FILE       members-analytics CSV to supply the full member
                         list and Seat Tier (recommended with a spend report)
-    --seat-price N      Price per Standard seat for the period (default 30.00,
-                        Team Standard monthly; use 25 for annual)
-    --premium-price N   Price per Premium seat (default 150.00 monthly)
+    --seat-price N      Price per Standard seat for the period (default 25.00)
+    --premium-price N   Price per Premium seat (default 125.00)
     --out FILE          Output .xlsx path (default: derived from input name)
     --no-xlsx           Console summary only
     --console-usage     Also fetch platform.claude.com cost data via the
@@ -459,8 +458,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", type=Path)
     ap.add_argument("--roster", type=Path, default=None)
-    ap.add_argument("--seat-price", type=float, default=30.0)
-    ap.add_argument("--premium-price", type=float, default=150.0)
+    ap.add_argument("--seat-price", type=float, default=25.0)
+    ap.add_argument("--premium-price", type=float, default=125.0)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-xlsx", action="store_true")
     ap.add_argument("--console-usage", action="store_true",

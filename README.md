@@ -134,8 +134,8 @@ python3 claude_team_cost_report.py members-analytics-<org>-....csv
 | Flag | Default | Meaning |
 |---|---|---|
 | `--roster FILE` | — | Members-analytics CSV used to supply the full member list and real seat tiers when the main input is a spend report |
-| `--seat-price N` | `30.00` | Price per **Standard** seat for the period. Team Standard is $30/member/month billed monthly, $25/member/month billed annually — pass `--seat-price 25` if you're on annual billing |
-| `--premium-price N` | `150.00` | Price per **Premium** seat, if any appear in your roster |
+| `--seat-price N` | `25.00` | Price per **Standard** seat for the period. Team Standard is $30/member/month billed monthly, $25/member/month billed annually — pass `--seat-price 30` if you're on monthly billing |
+| `--premium-price N` | `125.00` | Price per **Premium** seat, if any appear in your roster |
 | `--out FILE` | derived from input filename | Output `.xlsx` path |
 | `--no-xlsx` | off | Console summary only, skip the workbook |
 | `--console-usage` | off | Also fetch `platform.claude.com` (Console/API) cost data via the Admin API and add it as its own sheet — see [§6](#6-consoleapi-usage-optional---console-usage) |
@@ -150,8 +150,8 @@ seat tiers are costed at $0.
 ### Examples
 
 ```bash
-# Annual billing prices
-python3 claude_team_cost_report.py spend.csv --roster members.csv --seat-price 25
+# Override the defaults, e.g. for monthly billing
+python3 claude_team_cost_report.py spend.csv --roster members.csv --seat-price 30
 
 # Just the numbers, no spreadsheet
 python3 claude_team_cost_report.py spend.csv --roster members.csv --no-xlsx
